@@ -1,0 +1,276 @@
+
+
+from torch.utils.data import Dataset
+from utils import settings
+import os
+import scipy.io as sio
+import pickle
+import numpy as np
+from sklearn import metrics
+from PIL import Image
+import torchvision.transforms as transforms
+
+import torch
+import torch.nn as nn
+import torch.optim
+import torch.nn.functional as F
+
+import math
+import skimage.io as io
+from matplotlib import pyplot as plt
+
+import time
+
+from utils.light_cnn import LightCNN_9Layers
+from utils.agedata import AgeFaceDataset
+
+from utils import settings
+
+
+def save_checkpoint(state,  filename):
+    torch.save(state, filename)
+
+class DilatedResNet(nn.Module):
+    def __init__(self, num_classes = 10000):
+        super(DilatedResNet, self).__init__()
+        
+        self.block1 = nn.Linear(256, 256)
+        self.block2 = nn.Linear(256, 256 )
+        self.block3= nn.Linear(256, 256)
+        
+        #self.fc = nn.Linear(512, num_classes)   #for softmax
+        self.fc = nn.Linear(256, num_classes)   #for softmax
+        
+    def forward(self, x):
+        '''
+        x1 = self.block1(x)
+        x1 = x1 - x
+        
+        x2 = self.block2(x1)
+        
+        x2 = x2 - x1
+        
+        x3 = self.block3(x2)
+        
+        x3 = x3 - x2
+        ''' 
+        x3 = x
+        x4 = self.fc(x3)
+        #print('x4 size', x4.size())
+        #assert(False)
+        return x3, x4  #x3 is feature to be used for testing and x4 is for softmax during training
+    
+def DilatedResNetModel(**kwargs):
+    model = DilatedResNet(**kwargs)
+    return model       
+
+def train(train_loader, dresmodel, lightcnnmodel, criterion, optimizer, epoch, device):
+    
+    running_loss = 0.   
+    
+    data_size = 0
+    
+    for (x, label) in train_loader:
+        
+        optimizer.zero_grad()
+        
+        x = x.to(device)
+        
+        label = torch.tensor(label, dtype = torch.long)
+            
+        label = label.to(device)
+        
+        _ , y = lightcnnmodel(x)
+        out = y #added by bala
+        #_ , out = dresmodel(y)    
+        #assert(False)
+        
+        #print(out.type(), out.size(), label.size(), label.type())
+        
+        
+        
+        loss  = criterion(out, label)
+        print('epoch  & loss are ', epoch,loss.data.cpu().numpy())
+        #assert(False)
+        
+        
+        loss.backward()
+        
+        optimizer.step()
+   
+        running_loss += loss.item() * label.size(0)
+
+        data_size += label.size(0)
+    
+    return running_loss / data_size
+        
+def accuracy(output, target, topk=(1,)):
+    
+    maxk = max(topk)
+    
+    batch_size = target.size(0)
+    #print(output,target)
+    _, pred = output.topk(maxk, 1, True, True)
+    
+    pred    = pred.t()
+    
+    #print(pred,target.view(1, -1).expand_as(pred))
+    #time.sleep(10)
+    correct = pred.eq(target.view(1, -1).expand_as(pred))
+
+    res = []
+    for k in topk:
+        correct_k = correct[:k].view(-1).float().sum(0)
+        res.append(correct_k.mul_(100.0 / batch_size))
+    return res
+
+def computegalleryfeatures(lightcnnmodel, transform):
+    metafile = os.path.join('../DB', 'meta_data/morph_metafile.pkl')  
+    root_path = settings.args.root_path
+        
+    with open(metafile, 'rb') as fd:
+        morph_dict = pickle.load(fd) 
+
+   
+    gallerylist = []
+    
+    for (key,value) in morph_dict.items():
+        gallerylist.append(value[1])
+    '''    
+    for i in range(0,10000):            
+            self.gallerylist.append([i, self.allist[i][1]])  #all young faces  with label
+    '''   
+    gallerylist = gallerylist[0:10000]
+    
+    print('gallery size',len(gallerylist))
+    
+    galleryfeatures = []
+    
+    with torch.no_grad():
+        for i in range(0,len(gallerylist)):
+            file1 = gallerylist[i].split('/')[-1]        
+            path1 = os.path.join(root_path, file1)
+            if os.path.exists(path1):
+                x = Image.open(path1).convert('L')            
+                x =  transform(x)
+                x = torch.unsqueeze(x, 0)
+                feature, _ = lightcnnmodel(x)
+                galleryfeatures.append(feature) 
+        
+    #print(len(galleryfeatures),galleryfeatures[0] )
+    #assert(False)
+    return galleryfeatures
+    
+    
+        
+        
+
+def validate(data_loader, dresmodel, lightcnnmodel, device, galleryfeatures, istrain = True ):
+    #print('\nInside validation')
+    acc = 0
+    
+    probefeatures = []
+    
+    with torch.no_grad():
+        for (x, label) in data_loader:
+            x = x.to(device)
+            label = label.to(device)
+
+            y,_ = lightcnnmodel(x)
+            for j in range(len(y)):
+                probefeatures.append(y[j].cpu().numpy())
+            
+    
+        print('probe length',len(probefeatures))
+        print('gallery size',len(galleryfeatures))
+
+        correct = 0
+        total = len(probefeatures)
+        
+        probe = np.array(probefeatures)
+	g = []       
+        for i in range(len(galleryfeatures)):
+            g.append(galleryfeatures[i].cpu().numpy())
+	 
+        gallery = np.array(g)
+        
+        d = cosine_similarity(probe,gallery)
+        
+        label = np.array([i for i in range(total)])
+        
+        output = np.argmax(d, axis = 1)
+        matches = np.sum(output = label)
+        acc = matches*100.0 / total
+        
+        return acc
+        
+   
+        
+    
+
+def test(test_loader, dresmodel, lightcnnmodel, device):
+    #print('\nInside testing')
+    
+    acc = 0
+    
+    gallery_feat_list = []
+    probe_feat_list = []
+    with torch.no_grad():
+        for (x1, x2,  label) in test_loader:
+            x1 = x1.to(device)
+            x2 = x2.to(device)
+            
+            label = label.to(device)
+
+            y1,_ = lightcnnmodel(x1)
+            y2,_ = lightcnnmodel(x2)
+
+            feature1,_ = dresmodel(y1)
+            feature2,_ = dresmodel(y2)
+            for j in range(len(feature1)):
+                gallery_feat_list.append(feature1[j])
+                probe_feat_list.append(feature2[j])
+            
+        
+        n = len(gallery_feat_list)
+        
+        #print(n)
+        correct  = 0
+        '''
+        gallery = torch.zeros(n,256, dtype = feature2.dtype)
+        probe = torch.zeros(n,256, dtype = feature2.dtype)
+        
+        for i  in range(n):
+            gallery[i,:] = gallery_feat_list[i].reshape(1,256)
+            probe[i,:] = probe_feat_list[i].reshape(1,256)
+            
+            
+        test = torch.zeros(n,256, dtype = feature2.dtype)  
+        '''
+       
+        for i  in range(n):
+            
+            mindist = math.inf
+            minindex = -1
+            #print(probe_feat_list[i].size())
+            for j in range(n):
+                d = 1 - F.cosine_similarity(probe_feat_list[i].reshape(1,256),gallery_feat_list[j].reshape(1,256))
+                if d < mindist:
+                    mindist = d
+                    minindex = j
+                    
+            print(' i matched with j', i,minindex)                    
+            if i == minindex:
+                correct += 1
+            
+        print('correct and total',correct,n)
+        acc = correct * 100.0 / n
+        
+        return acc
+                  
+                
+            
+            
+            
+            
+    
