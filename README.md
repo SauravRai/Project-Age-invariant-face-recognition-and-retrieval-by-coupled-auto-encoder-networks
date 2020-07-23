@@ -4,7 +4,7 @@ The repository contains the Pytorch Implementation of the paper Age invariant fa
 # Requirements
 1. Pytorch 0.4.1
 2. Numpy
-3. Saklearn
+3. Sklearn
 
 # Datasets
 CACD Dataset
